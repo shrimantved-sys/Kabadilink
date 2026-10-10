@@ -1,0 +1,442 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'KabadiLink - Hackathon Prototype Digital paper trail for informal e-waste
+  scrap collectors and authorised recyclers under India''s E-Waste Rules 2022.
+
+  '
+Parameters:
+  NotifyEmail:
+    Type: String
+    Default: notifications@kabadilink.demo
+    Description: Email address subscribed to SNS notifications for e-waste lifecycle
+      events.
+  DemoMode:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+    - 'true'
+    - 'false'
+    Description: Enable /demo seed and simulation endpoints.
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 10
+    MemorySize: 256
+    Architectures:
+    - x86_64
+    Environment:
+      Variables:
+        TABLE_NAME:
+          Ref: KabadiLinkTable
+        PHOTOS_BUCKET:
+          Ref: PhotosBucket
+        SNS_TOPIC_ARN:
+          Ref: LifecycleEventsTopic
+        DEMO_MODE:
+          Ref: DemoMode
+        NODE_OPTIONS: --enable-source-maps
+Resources:
+  KabadiLinkTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: kabadilink
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: PK
+        AttributeType: S
+      - AttributeName: SK
+        AttributeType: S
+      - AttributeName: GSI1PK
+        AttributeType: S
+      - AttributeName: GSI1SK
+        AttributeType: S
+      KeySchema:
+      - AttributeName: PK
+        KeyType: HASH
+      - AttributeName: SK
+        KeyType: RANGE
+      GlobalSecondaryIndexes:
+      - IndexName: GSI1
+        KeySchema:
+        - AttributeName: GSI1PK
+          KeyType: HASH
+        - AttributeName: GSI1SK
+          KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: kabadilink-photos-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+        - AllowedHeaders:
+          - '*'
+          AllowedMethods:
+          - POST
+          - PUT
+          AllowedOrigins:
+          - '*'
+          MaxAge: 3000
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: kabadilink-web-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: KabadiLinkOAC
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  WebsiteCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: KabadiLink Web Distribution
+        Origins:
+        - Id: S3Origin
+          DomainName:
+            Fn::GetAtt:
+            - WebsiteBucket
+            - RegionalDomainName
+          OriginAccessControlId:
+            Fn::GetAtt:
+            - CloudFrontOAC
+            - Id
+          S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+          - GET
+          - HEAD
+          - OPTIONS
+          CachedMethods:
+          - GET
+          - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        CustomErrorResponses:
+        - ErrorCode: 404
+          ResponseCode: 200
+          ResponsePagePath: /index.html
+        - ErrorCode: 403
+          ResponseCode: 200
+          ResponsePagePath: /index.html
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AllowCloudFrontServicePrincipal
+          Effect: Allow
+          Principal:
+            Service: cloudfront.amazonaws.com
+          Action: s3:GetObject
+          Resource:
+            Fn::Sub: ${WebsiteBucket.Arn}/*
+          Condition:
+            StringEquals:
+              AWS:SourceArn:
+                Fn::Sub: arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebsiteCloudFrontDistribution}
+  LifecycleEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: kabadilink-lifecycle-events
+      DisplayName: KabadiLink Lifecycle Notifications
+  LifecycleEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn:
+        Ref: LifecycleEventsTopic
+      Protocol: email
+      Endpoint:
+        Ref: NotifyEmail
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      CorsConfiguration:
+        AllowOrigins:
+        - Fn::Sub: https://${WebsiteCloudFrontDistribution.DomainName}
+        - http://localhost:5173
+        - http://127.0.0.1:5173
+        AllowMethods:
+        - GET
+        - POST
+        - OPTIONS
+        AllowHeaders:
+        - Content-Type
+        - Authorization
+        - X-Requested-With
+        MaxAge: 3600
+  RequestsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${RequestsFunction}
+      RetentionInDays: 7
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${CollectorFunction}
+      RetentionInDays: 7
+  ReceiptsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${ReceiptsFunction}
+      RetentionInDays: 7
+  DemoLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${DemoFunction}
+      RetentionInDays: 7
+  RequestsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: RequestsFunction
+      Handler: backend/handlers/requests.handler
+      Description: Household requests creation, status tracking, cancellation, and
+        photo presign
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+          - dynamodb:Query
+          Resource:
+          - Fn::GetAtt:
+            - KabadiLinkTable
+            - Arn
+          - Fn::Sub: ${KabadiLinkTable.Arn}/index/*
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource:
+            Fn::Sub: ${PhotosBucket.Arn}/*
+        - Effect: Allow
+          Action:
+          - sns:Publish
+          Resource:
+            Ref: LifecycleEventsTopic
+      Events:
+        CreateRequest:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /requests
+        GetRequest:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: GET
+            Path: /requests/{id}
+        CancelRequest:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /requests/{id}/cancel
+        PresignUpload:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /uploads/presign
+    Metadata:
+      SamResourceId: RequestsFunction
+  CollectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: CollectorFunction
+      Handler: backend/handlers/collector.handler
+      Description: Collector trip grouping, batch accept, OTP pickup confirmation,
+        and recycler handover
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+          - dynamodb:Query
+          - dynamodb:Scan
+          Resource:
+          - Fn::GetAtt:
+            - KabadiLinkTable
+            - Arn
+          - Fn::Sub: ${KabadiLinkTable.Arn}/index/*
+        - Effect: Allow
+          Action:
+          - sns:Publish
+          Resource:
+            Ref: LifecycleEventsTopic
+      Events:
+        GetOpenRequests:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: GET
+            Path: /collector/requests
+        AcceptTrip:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /collector/accept
+        ConfirmPickup:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /collector/requests/{id}/pickup
+        GetRecyclers:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: GET
+            Path: /recyclers
+        HandoverRecycler:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /collector/requests/{id}/handover
+    Metadata:
+      SamResourceId: CollectorFunction
+  ReceiptsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ReceiptsFunction
+      Handler: backend/handlers/receipts.handler
+      Description: Receipt retrieval and public tamper verification
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          Resource:
+            Fn::GetAtt:
+            - KabadiLinkTable
+            - Arn
+      Events:
+        GetReceipt:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: GET
+            Path: /receipts/{receiptId}
+        VerifyReceipt:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: GET
+            Path: /verify/{receiptId}
+    Metadata:
+      SamResourceId: ReceiptsFunction
+  DemoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: DemoFunction
+      Handler: backend/handlers/demo.handler
+      Description: Demo control panel operations (seed, reset, simulate recycler intake)
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+          - dynamodb:DeleteItem
+          - dynamodb:Scan
+          Resource:
+            Fn::GetAtt:
+            - KabadiLinkTable
+            - Arn
+      Events:
+        SeedDemo:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /demo/seed
+        ResetDemo:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /demo/reset
+        SimulateAck:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Method: POST
+            Path: /demo/recycler-ack/{id}
+    Metadata:
+      SamResourceId: DemoFunction
+Outputs:
+  HttpApiUrl:
+    Description: HTTP API Gateway endpoint URL
+    Value:
+      Fn::Sub: https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  CloudFrontUrl:
+    Description: CloudFront distribution domain name
+    Value:
+      Fn::Sub: https://${WebsiteCloudFrontDistribution.DomainName}
+  PhotosBucketName:
+    Description: S3 bucket for household e-waste photos
+    Value:
+      Ref: PhotosBucket
+  WebsiteBucketName:
+    Description: S3 bucket for static website assets
+    Value:
+      Ref: WebsiteBucket
+  TopicArn:
+    Description: SNS Topic ARN for lifecycle notifications
+    Value:
+      Ref: LifecycleEventsTopic
